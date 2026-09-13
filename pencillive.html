@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="ta">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Live Pencil art </title>
+  <link rel="icon" href="C:\Users\HARIPRIYA\OneDrive\Documents\Desktop\Vigna hari chand\pencil.jpg">
+  <style>
+    body { font-family: Arial, sans-serif; display:flex; flex-direction:column; align-items:center; gap:10px; padding:16px; background:#f5f5f5; }
+    #container { display:flex; gap:12px; align-items:flex-start; }
+    video, canvas { border:1px solid #ccc; border-radius:6px; }
+    .controls { display:flex; gap:8px; }
+    button { padding:8px 12px; border-radius:6px; cursor:pointer; }
+    #status { font-size:0.9rem; color:#333; }
+  </style>
+</head>
+<body bgcolor="lightblue">
+  <h2>Live Pencil Skecth</h2>
+  <div class="controls">
+    <button id="startBtn">Start Camera</button>
+    <button id="stopBtn" disabled>Stop Camera</button>
+    <button id="switchBtn">Switch Camera</button>
+    <button id="captureBtn" disabled>Capture</button>
+    <a id="downloadLink" style="display:none;">Download</a>
+  </div>
+  <div id="status">OpenCV status: loading...</div>
+
+  <div id="container">
+    <video id="video" width="480" height="300" autoplay muted playsinline></video>
+    <canvas id="canvasOut" width="480" height="300"></canvas>
+  </div>
+
+  <!-- OpenCV.js from official CDN -->
+  <script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvReady();" ></script>
+
+  <script>
+  let video = document.getElementById('video');
+  let canvasOut = document.getElementById('canvasOut');
+  let ctxOut = canvasOut.getContext('2d');
+
+  let startBtn = document.getElementById('startBtn');
+  let stopBtn = document.getElementById('stopBtn');
+  let switchBtn = document.getElementById('switchBtn');
+  let facingMode = "user"; // initial camera
+  let currentfacingMode = "user";
+  switchBtn.addEventListener('click', () => {
+    currentfacingMode = (currentfacingMode === "user") ? "environment" : "user";
+    startCamera();
+  });
+  let captureBtn = document.getElementById('captureBtn');
+  let downloadLink = document.getElementById('downloadLink');
+  let status = document.getElementById('status');
+
+  let stream = null;
+  let streaming = false;
+  let srcMat = null, grayMat = null, invMat = null, blurMat = null, sketchMat = null, edges = null, dst = null;
+  let rafId = null;
+
+  function onOpenCvReady() {
+    if (cv && cv.getBuildInformation) {
+      status.textContent = 'OpenCV.js loaded.';
+      startBtn.disabled = false;
+    } else {
+      status.textContent = 'Failed to load OpenCV.js';
+    }
+  }
+
+  async function startCamera() {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+      video.srcObject = stream;
+      await video.play();
+      streaming = true;
+
+      // init Mats with video size
+      let w = video.videoWidth || 640;
+      let h = video.videoHeight || 480;
+      canvasOut.width = w; canvasOut.height = h;
+
+      srcMat = new cv.Mat(h, w, cv.CV_8UC4);
+      grayMat = new cv.Mat(h, w, cv.CV_8UC1);
+      invMat = new cv.Mat(h, w, cv.CV_8UC1);
+      blurMat = new cv.Mat(h, w, cv.CV_8UC1);
+      sketchMat = new cv.Mat(h, w, cv.CV_8UC1);
+      edges = new cv.Mat(h, w, cv.CV_8UC1);
+      dst = new cv.Mat(h, w, cv.CV_8UC1);
+
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      captureBtn.disabled = false;
+
+      status.textContent = 'Camera started — processing...';
+      processVideo();
+    } catch (err) {
+      status.textContent = 'Error accessing camera: ' + err;
+      console.error(err);
+    }
+  }
+
+  function stopCamera() {
+    streaming = false;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    captureBtn.disabled = true;
+    status.textContent = 'Camera stopped.';
+    if (rafId) cancelAnimationFrame(rafId);
+    if (stream) {
+      stream.getTracks().forEach(t => t.stop());
+      stream = null;
+    }
+    // free mats
+    [srcMat, grayMat, invMat, blurMat, sketchMat, edges, dst].forEach(m => { if (m) { m.delete(); } });
+    srcMat = grayMat = invMat = blurMat = sketchMat = edges = dst = null;
+  }
+
+  function switchcamera() {
+    facingMode = (currentfacingMode === "user") ? "environment" : "user";
+    startCamera();
+  }
+
+  function crossHatchMask(matGray) {
+    // create hatch pattern in JS canvas then extract as mask
+    const w = matGray.cols, h = matGray.rows;
+    const temp = document.createElement('canvas');
+    temp.width = w; temp.height = h;
+    const ct = temp.getContext('2d');
+    ct.fillStyle = 'black';
+    ct.fillRect(0,0,w,h);
+    ct.strokeStyle = 'white';
+    ct.lineWidth = 1;
+
+    for (let i = -h; i < w; i += 10) {
+      ct.beginPath(); ct.moveTo(i, 0); ct.lineTo(i + 50, h); ct.stroke();
+    }
+    for (let i = -h; i < w; i += 10) {
+      ct.beginPath(); ct.moveTo(i, h); ct.lineTo(i + 50, 0); ct.stroke();
+    }
+    // use matGray to threshold darker regions
+    let hatchImgData = ct.getImageData(0,0,w,h);
+    let hatchMat = cv.matFromImageData(hatchImgData);
+    // convert to gray and mask by darker areas
+    let hatchGray = new cv.Mat();
+    cv.cvtColor(hatchMat, hatchGray, cv.COLOR_RGBA2GRAY);
+    let mask = new cv.Mat();
+    cv.threshold(matGray, mask, 140, 255, cv.THRESH_BINARY_INV);
+    let result = new cv.Mat();
+    cv.bitwise_and(hatchGray, hatchGray, result, mask);
+    hatchMat.delete(); hatchGray.delete(); mask.delete();
+    return result; // caller should delete
+  }
+
+  function processVideo() {
+    try {
+      if (!streaming) return;
+      // read frame to canvas then to srcMat
+      ctxOut.drawImage(video, 0, 0, canvasOut.width, canvasOut.height);
+      let imageData = ctxOut.getImageData(0, 0, canvasOut.width, canvasOut.height);
+      srcMat.data.set(imageData.data);
+
+      // convert to gray
+      cv.cvtColor(srcMat, grayMat, cv.COLOR_RGBA2GRAY);
+
+      // edges (outline)
+      cv.Canny(grayMat, edges, 80, 180);
+      let k = cv.Mat.ones(2,2,cv.CV_8U);
+      cv.dilate(edges, edges, k, new cv.Point(-1,-1), 0);
+      cv.bitwise_not(edges, edges);
+      k.delete();
+
+      // sketch effect: invert -> blur -> divide
+      cv.bitwise_not(grayMat, invMat);
+      cv.GaussianBlur(invMat, blurMat, new cv.Size(31,31), 0);
+      // sketch = gray / (255-blur) * scale
+      // implement divide: sketch = gray * 255 / (255 - blur)
+      // OpenCV.js has divide: cv.divide(src1, src2, dst, scale)
+      let denom = new cv.Mat();
+      cv.subtract(new cv.Mat(blurMat.rows, blurMat.cols, blurMat.type(), new cv.Scalar(255)), blurMat, denom);
+      cv.divide(grayMat, denom, sketchMat, 255);
+      denom.delete();
+
+      // cross-hatch layer
+      let hatch = crossHatchMask(sketchMat);
+
+      // combine hatch with sketch
+      cv.addWeighted(sketchMat, 0.85, hatch, 0.35, 0.0, dst);
+      hatch.delete();
+
+      // blend with edges
+      cv.addWeighted(dst, 0.9, edges, 0.1, 0.0, dst);
+
+      // normalize & show
+      cv.normalize(dst, dst, 0, 255, cv.NORM_MINMAX);
+
+      // convert single channel to RGBA for putting to canvas
+      let out = new cv.Mat();
+      cv.cvtColor(dst, out, cv.COLOR_GRAY2RGBA);
+      // copy to canvas
+      let outImg = new ImageData(new Uint8ClampedArray(out.data), out.cols, out.rows);
+      ctxOut.putImageData(outImg, 0, 0);
+      out.delete();
+
+      // schedule next frame
+      rafId = requestAnimationFrame(processVideo);
+    } catch (err) {
+      console.error(err);
+      status.textContent = "Processing error: " + err;
+    }
+  }
+
+  captureBtn.addEventListener('click', () => {
+    // capture current canvas content as PNG
+    let dataURL = canvasOut.toDataURL('image/png');
+    downloadLink.href = dataURL;
+    downloadLink.download = 'sketch_capture.png';
+    downloadLink.style.display = 'inline-block';
+    downloadLink.textContent = 'Download captured image';
+    status.textContent = 'Image captured — click Download to save.';
+  });
+
+  startBtn.addEventListener('click', startCamera);
+  stopBtn.addEventListener('click', stopCamera);
+
+  // cleanup on page unload
+  window.addEventListener('beforeunload', () => { if (stream) stream.getTracks().forEach(t=>t.stop()); });
+  </script>
+</body>
+</html>
